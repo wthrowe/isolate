@@ -1,0 +1,200 @@
+#!/bin/bash -e
+
+die() {
+    test -n "$1" && echo "$1" >&2
+    exit 1
+}
+
+# Is first directory a (possibly non-direct) subdirectory of (or equal
+# to) second?
+is_under() {
+    case "$1" in
+	"$2"|"$2"/*) return 0 ;;
+	*) return 1 ;;
+    esac
+}
+
+parse_options() {
+    while [ "$#" -gt 0 ] ; do
+	case "$1" in
+	    --config|-f)
+		read_config "$2"
+		shift 2
+		;;
+	    --isolate-net) isolate_net=yes ; shift ;;
+	    --no-isolate-net) isolate_net=no ; shift ;;
+	    --hide|--share|--readonly|--copy)
+		isolate_fs+=( "${1#--}" "$2" )
+		shift 2
+		;;
+	    --) shift ; break ;;
+	    *) break
+	esac
+    done
+    [ "$#" -gt 0 ] && command=( "$@" )
+    : # Return true
+}
+
+read_config() {
+    [ -f "$1" ] || die "No config file: $1"
+    . "$1" || die
+}
+
+setup_empty_net() {
+    ip link set lo up
+}
+
+do_mounts() {
+    local root
+    trap 'umount --lazy "${root}" || : ; rmdir "${root}"' EXIT
+    root=$(mktemp -d)
+
+    mount --rbind / "${root}"
+    mount --make-unbindable "${root}"
+
+    local done=()
+    while [ $# -ne 0 ] ; do
+	local type=$1
+	local path=$2
+	shift 2
+	[ -n "${path}" ] || die "Missing path for ${type} mount"
+	[ -e "${path}" ] || die "${path} does not exist"
+	path=$(realpath "${path}")
+
+	local prev
+	for prev in "${done[@]}" ; do
+	    is_under "${prev}" "${path}" && \
+		die "Mounting over previous mount: ${path} on ${prev}"
+	done
+
+	local dest=${root}${path}
+	if [ -d "${path}" ] ; then
+	    mkdir -p "${dest}"
+	else
+	    mkdir -p "$(dirname "${dest}")"
+	    touch "${dest}"
+	fi
+
+	case "${type}" in
+	    hide) mount -t tmpfs tmpfs "${dest}" ;;
+	    share) mount --rbind "${path}" "${dest}" ;;
+	    readonly)
+		mount --rbind "${path}" "${dest}"
+		# rbind,ro doesn't work
+		recursive_readonly "${dest}"
+		;;
+	    copy)
+		[ -d "${dest}" ] || die "Copying files is not supported"
+		mount -t tmpfs tmpfs "${dest}"
+		cp -r "${path}/." "${dest}"
+		;;
+	    *) die "Invalid mount type: ${type}" ;;
+	esac
+	done+=( "${path}" )
+    done
+
+    # You can't unshare in a chroot, so we use pivot_root instead
+    # (just like lxc).
+    pushd "${root}" >/dev/null
+    /sbin/pivot_root . .
+    # Having / unbindable can cause issues.  (For example, this script
+    # can't be run.)
+    mount --make-shared .
+    umount --lazy .
+    popd >/dev/null
+    rmdir "${root}"
+    trap - EXIT
+}
+
+recursive_readonly() {
+    local source dest rest
+    while read -r source dest rest ; do
+	is_under "${dest}" "$1" &&
+	    mount -o remount,ro,bind "${source}" "${dest}"
+    done </proc/self/mounts
+    : # Return true
+}
+
+start_child() {
+    uid=$1
+    gid=$2
+    shift 2
+
+    # The new user environment has to be set up after the process
+    # starts, so fork a task to do that.
+    (
+	# test -s doesn't work in /proc
+	while grep . "/proc/$$/uid_map" ; do : ; done
+	echo "${gid} 0 1" > "/proc/$$/gid_map"
+	echo "${uid} 0 1" > "/proc/$$/uid_map"
+    ) >/dev/null 2>&1 &
+    # unshare again to restore expected uid
+    exec unshare \
+	 --user \
+	 sh -c \
+	 'while [ "$(id -u)" != "'"${uid}"'" ] ; do : ; done ; exec "$@"' \
+	 'dollar-zero' "$@"
+    die "Failed to exec sh"
+}
+
+stage1() {
+    name=$(basename "$0")
+    realexec="$(readlink -f "$0")"
+    realname="$(basename "${realexec}")"
+    configdir="$(dirname "${realexec}")"
+
+    isolate_net=no
+    isolate_fs=()
+    command=()
+
+    if [ "${name}" = "${realname}" ] ; then
+	parse_options "$@"
+    else
+	read_config "${configdir}/${name}.conf"
+	command+=( "$@" )
+    fi
+
+    [ "${#command[@]}" -ne 0 ] || die "No command specified"
+    case "${command[0]}" in
+	-*) die "Command '${command[0]}' cannot begin with a '-'"
+    esac
+
+    unshare_args=()
+    [ "${isolate_net}" != no ] &&
+	unshare_args+=( --net )
+    [ "${#isolate_fs[@]}" != 0 ] &&
+	unshare_args+=( --mount --propagation slave )
+
+    exec unshare \
+	 --user \
+	 --map-root-user \
+	 "${unshare_args[@]}" \
+	 "${realexec}" --stage2 \
+	 "$(id -u)" "$(id -g)" "${isolate_net}" "${isolate_fs[@]}" \
+	 -- "${command[@]}"
+    die "Failed to exec stage 2"
+}
+
+stage2() {
+    uid=$1
+    gid=$2
+    isolate_net=$3
+    shift 3
+    isolate_fs=()
+    while [ "$1" != -- ] ; do
+	[ $# = 0 ] && die
+	isolate_fs+=( "$1" )
+	shift
+    done
+    shift
+
+    [ "${isolate_net}" != no ] && setup_empty_net
+    [ "${#isolate_fs[@]}" != 0 ] && do_mounts "${isolate_fs[@]}"
+
+    start_child "${uid}" "${gid}" "$@"
+}
+
+case "$1" in
+    --stage2) shift ; stage2 "$@" ; break ;;
+    *) stage1 "$@" ; break ;;
+esac

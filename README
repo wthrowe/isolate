@@ -1,0 +1,27 @@
+isolate - mini-containers
+
+Usage: isolate [options] [--] command [args...]
+
+Run `command` with a modified view of the world.  Not intended for
+protection from malicious code, just for preventing things from
+mucking around where they shouldn't.
+
+Network modification:
+  --(no-)isolate-net - Remove all network devices except the loopback.
+Filesystem modification:
+  --hide - Replace with an empty directory.
+  --share - Replace file/directory with the actual version.  Generally used
+            for subdirectories of a --hide.
+  --readonly - Make file/directory read-only view of the actual version.
+  --copy - Replace directory with a copy of the actual version (on a tmpfs).
+Other:
+  --config file - Source a config file.  The file can set the bash variables:
+    command=( command [args...] )
+    isolate_net=yes|no
+    isolate_fs=( hide dir1 share dir2 ... )
+
+If isolate is invoked using a different name, it looks for a `.conf`
+file sharing that name in the directory the isolate script is in.
+That file is sourced as if passed to --config.  No command line
+processing is performed and all options are passed through to the
+wrapped command (which should be specified in the config file).
